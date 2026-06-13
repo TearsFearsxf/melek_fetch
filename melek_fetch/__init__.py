@@ -1,3 +1,4 @@
+from .fetcher import MelekFetchController
 from .core import (
     SystemDetector,
     MonitorConfig,
@@ -7,6 +8,7 @@ from .core import (
 )
 
 __all__ = [
+    "MelekFetchController",
     "SystemDetector",
     "MonitorConfig",
     "HardwareMonitor",
