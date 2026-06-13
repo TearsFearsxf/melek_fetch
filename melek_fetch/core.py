@@ -1,696 +1,557 @@
 """
-melek_sys.core — Melek AI Hardware Monitoring Engine
-====================================================
-This module provides classes for automatic hardware detection, low-overhead background
-monitoring, mode-based threshold management, and unresponsive process handling on Windows.
+melek_fetch.py — Melek AI Asistanı: Sessiz Bilgi Toplayıcı Modülü
+=================================================================
+Yazar        : Melek Projesi
+Versiyon     : 2.0.0
+Açıklama     : Hava durumu, döviz/altın ve Wikipedia verilerini
+               tamamen ücretsiz, anahtarsız (No-Key) API'ler üzerinden
+               arka planda çeken, RAM tabanlı TTL önbellekli,
+               user-agent rotasyonlu, timeout korumalı veri motoru.
+
+Bağımlılıklar: requests, beautifulsoup4
+               pip install requests beautifulsoup4
 """
 
-import os
-import sys
 import time
-import csv
+import random
 import logging
-import platform
-import subprocess
-import threading
-from typing import Callable, Dict, List, Optional, Tuple, Any
+import requests
+from bs4 import BeautifulSoup
+from typing import Any, Dict, Optional, Tuple
 
-import psutil
-
-# Setup module logger
-logger = logging.getLogger("MelekSys")
-logger.setLevel(logging.INFO)
-
-# Make sure basic output is formatted if not configured by the host application
-if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
-    logger.addHandler(handler)
+# ---------------------------------------------------------------------------
+# Loglama ayarları
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("MelekFetch")
 
 
-class SystemInfo:
-    """Dataclass to hold system hardware specifications."""
+# ---------------------------------------------------------------------------
+# Sabitler
+# ---------------------------------------------------------------------------
+
+# Gerçekçi tarayıcı kimlikleri havuzu (User-Agent Rotasyonu)
+USER_AGENTS: list[str] = [
+    # Chrome / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Firefox / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+    "Gecko/20100101 Firefox/125.0",
+    # Edge / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    # Safari / macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    # Chrome / Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Firefox / macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) "
+    "Gecko/20100101 Firefox/125.0",
+]
+
+# TTL (saniye cinsinden)
+TTL_DOVIZ: int    = 600   # 10 dakika
+TTL_HAVA: int     = 1800  # 30 dakika
+TTL_WIKI: int     = 3600  # 1 saat
+
+# Ağ isteği zaman aşımı (saniye)
+REQUEST_TIMEOUT: int = 4
+
+
+# ---------------------------------------------------------------------------
+# Yardımcı: CacheEntry
+# ---------------------------------------------------------------------------
+
+class CacheEntry:
+    """Tek bir önbellek kaydını ve TTL bilgisini tutar."""
+
+    def __init__(self, data: Any, ttl: int) -> None:
+        self.data: Any = data
+        self.expires_at: float = time.monotonic() + ttl
+
+    def is_valid(self) -> bool:
+        """Kaydın süresi dolmadıysa True döner."""
+        return time.monotonic() < self.expires_at
+
+    def remaining(self) -> float:
+        """Kalan geçerlilik süresi (saniye)."""
+        return max(0.0, self.expires_at - time.monotonic())
+
+
+# ---------------------------------------------------------------------------
+# Ana Sınıf: MelekFetchController
+# ---------------------------------------------------------------------------
+
+class MelekFetchController:
+    """
+    Melek AI asistanı için merkezi arka-plan veri motoru.
+
+    Özellikler
+    ----------
+    - RAM tabanlı TTL önbellek (her veri tipi için ayrı geçerlilik süresi)
+    - User-Agent rotasyonu ile bot tespitine karşı koruma
+    - Katı timeout ve kapsamlı hata yakalama
+    - Üç ücretsiz veri motoru: Hava Durumu, Döviz/Altın, Wikipedia
+    """
+
     def __init__(self) -> None:
-        self.cpu_name: str = "Unknown CPU"
-        self.cpu_cores_physical: int = 0
-        self.cpu_cores_logical: int = 0
-        self.ram_total_gb: float = 0.0
-        self.gpu_name: str = "Unknown GPU"
-        self.gpu_vram_total_mb: float = 0.0
-        self.disks: List[Dict[str, Any]] = []
+        # Anahtar: cache_key (str) → CacheEntry
+        self._cache: Dict[str, CacheEntry] = {}
+        logger.info("MelekFetchController başlatıldı. Önbellek temiz.")
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Serializes specifications into a dictionary."""
+    # ------------------------------------------------------------------
+    # Dahili yardımcılar
+    # ------------------------------------------------------------------
+
+    def _build_headers(self) -> Dict[str, str]:
+        """Her istekte rastgele bir User-Agent seçerek HTTP başlığı üretir."""
         return {
-            "cpu_name": self.cpu_name,
-            "cpu_cores_physical": self.cpu_cores_physical,
-            "cpu_cores_logical": self.cpu_cores_logical,
-            "ram_total_gb": self.ram_total_gb,
-            "gpu_name": self.gpu_name,
-            "gpu_vram_total_mb": self.gpu_vram_total_mb,
-            "disks": self.disks,
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "DNT": "1",
         }
 
-    def __str__(self) -> str:
-        disk_str = ", ".join([f"{d['model']} ({d['size_gb']} GB)" for d in self.disks])
+    def _get_json(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
+        """
+        Verilen URL'ye GET isteği atar, JSON yanıtını döner.
+        Hata durumunda None döner; hiçbir zaman istisna fırlatmaz.
+        """
+        try:
+            response = requests.get(
+                url,
+                headers=self._build_headers(),
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout:
+            logger.warning("Zaman aşımı: %s", url)
+        except requests.exceptions.ConnectionError:
+            logger.warning("Bağlantı hatası: %s", url)
+        except requests.exceptions.HTTPError as exc:
+            logger.warning("HTTP hatası %s: %s", exc.response.status_code, url)
+        except Exception as exc:
+            logger.error("Beklenmedik hata (%s): %s", type(exc).__name__, exc)
+        return None
+
+    def _get_text(self, url: str, params: Optional[Dict] = None) -> Optional[str]:
+        """
+        Verilen URL'ye GET isteği atar, ham metin yanıtını döner.
+        Hata durumunda None döner; hiçbir zaman istisna fırlatmaz.
+        """
+        try:
+            response = requests.get(
+                url,
+                headers=self._build_headers(),
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.Timeout:
+            logger.warning("Zaman aşımı: %s", url)
+        except requests.exceptions.ConnectionError:
+            logger.warning("Bağlantı hatası: %s", url)
+        except requests.exceptions.HTTPError as exc:
+            logger.warning("HTTP hatası %s: %s", exc.response.status_code, url)
+        except Exception as exc:
+            logger.error("Beklenmedik hata (%s): %s", type(exc).__name__, exc)
+        return None
+
+    def _cache_get(self, key: str) -> Tuple[bool, Any]:
+        """
+        Önbellekte geçerli bir kayıt varsa (True, data) döner.
+        Yoksa veya süresi dolmuşsa (False, None) döner.
+        """
+        entry = self._cache.get(key)
+        if entry and entry.is_valid():
+            logger.info("[CACHE] Veri internete çıkılmadan hafızadan okundu → %s", key)
+            return True, entry.data
+        return False, None
+
+    def _cache_set(self, key: str, data: Any, ttl: int) -> None:
+        """Veriyi önbelleğe yazar."""
+        self._cache[key] = CacheEntry(data, ttl)
+        logger.info("[CACHE] Önbelleğe yazıldı → %s (TTL: %ds)", key, ttl)
+
+    def cache_stats(self) -> Dict[str, float]:
+        """
+        Önbellekteki tüm anahtarların kalan geçerlilik sürelerini döner.
+        Süresi dolmuş kayıtları da raporlar.
+        """
+        return {
+            key: entry.remaining()
+            for key, entry in self._cache.items()
+        }
+
+    # ------------------------------------------------------------------
+    # Motor A: Hava Durumu (Open-Meteo — Tamamen Ücretsiz, No-Key)
+    # ------------------------------------------------------------------
+
+    # Open-Meteo geocoding API'si ile şehir adından koordinat bulma
+    _GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
+    _WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+    # WMO hava durumu kodu → Türkçe açıklama
+    _WMO_CODES: Dict[int, str] = {
+        0: "Açık",
+        1: "Çoğunlukla açık", 2: "Parçalı bulutlu", 3: "Kapalı",
+        45: "Sisli", 48: "Kırağı sisli",
+        51: "Hafif çisenti", 53: "Orta çisenti", 55: "Yoğun çisenti",
+        61: "Hafif yağmurlu", 63: "Orta yağmurlu", 65: "Şiddetli yağmurlu",
+        71: "Hafif karlı", 73: "Orta karlı", 75: "Yoğun karlı",
+        77: "Kar tanecikleri",
+        80: "Hafif sağanak", 81: "Orta sağanak", 82: "Şiddetli sağanak",
+        85: "Hafif kar yağışı", 86: "Yoğun kar yağışı",
+        95: "Gök gürültülü fırtına",
+        96: "Hafif dolulu fırtına", 99: "Yoğun dolulu fırtına",
+    }
+
+    def _sehir_koordinat(self, sehir: str) -> Optional[Tuple[float, float, str]]:
+        """
+        Şehir adını Open-Meteo Geocoding API'si üzerinden enlem/boylama çevirir.
+        Başarılı olursa (enlem, boylam, resmi_şehir_adı) döner; bulamazsa None.
+        """
+        data = self._get_json(self._GEO_URL, params={"name": sehir, "count": 1, "language": "tr"})
+        if data and data.get("results"):
+            sonuc = data["results"][0]
+            return sonuc["latitude"], sonuc["longitude"], sonuc.get("name", sehir)
+        logger.warning("Şehir bulunamadı: %s", sehir)
+        return None
+
+    def hava_durumu(self, sehir: str) -> str:
+        """
+        Belirtilen şehir için anlık hava durumunu Türkçe metin olarak döner.
+
+        Parametreler
+        ------------
+        sehir : str
+            Şehir adı (Türkçe veya İngilizce kabul edilir).
+
+        Döndürür
+        --------
+        str
+            Türkçe hava durumu özeti veya hata açıklaması.
+        """
+        cache_key = f"hava:{sehir.lower().strip()}"
+        hit, cached = self._cache_get(cache_key)
+        if hit:
+            return cached
+
+        konum = self._sehir_koordinat(sehir)
+        if not konum:
+            return f"❌ '{sehir}' şehri için konum bilgisi alınamadı."
+
+        enlem, boylam, resmi_ad = konum
+        params = {
+            "latitude": enlem,
+            "longitude": boylam,
+            "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weathercode,windspeed_10m",
+            "timezone": "auto",
+            "wind_speed_unit": "kmh",
+        }
+        data = self._get_json(self._WEATHER_URL, params=params)
+        if not data or "current" not in data:
+            return "❌ Hava durumu verisi alınamadı. Lütfen tekrar deneyin."
+
+        current = data["current"]
+        wmo = int(current.get("weathercode", 0))
+        durum_aciklama = self._WMO_CODES.get(wmo, "Bilinmeyen")
+
+        sonuc = (
+            f"🌤 {resmi_ad} için anlık hava durumu:\n"
+            f"   Durum       : {durum_aciklama}\n"
+            f"   Sıcaklık    : {current.get('temperature_2m', '?')} °C"
+            f" (Hissedilen: {current.get('apparent_temperature', '?')} °C)\n"
+            f"   Nem         : %{current.get('relative_humidity_2m', '?')}\n"
+            f"   Rüzgar      : {current.get('windspeed_10m', '?')} km/s"
+        )
+        self._cache_set(cache_key, sonuc, TTL_HAVA)
+        return sonuc
+
+    # ------------------------------------------------------------------
+    # Motor B: Döviz ve Altın (ExchangeRate-API + TCMB yedek)
+    # ------------------------------------------------------------------
+
+    _EXCHANGE_URL = "https://api.exchangerate-api.com/v4/latest/TRY"
+    _TCMB_URL     = "https://www.tcmb.gov.tr/kurlar/today.xml"
+
+    def doviz_kurlari(self) -> str:
+        """
+        Güncel USD, EUR ve TRY bazlı döviz kurlarını çeker.
+        Önce ücretsiz ExchangeRate-API denenir; başarısız olursa TCMB XML'i
+        ayrıştırılır (yedek motor).
+
+        Döndürür
+        --------
+        str
+            Türkçe biçimlendirilmiş döviz özeti veya hata açıklaması.
+        """
+        cache_key = "doviz:try_bazli"
+        hit, cached = self._cache_get(cache_key)
+        if hit:
+            return cached
+
+        # --- Birincil Motor: ExchangeRate-API ---
+        sonuc = self._doviz_exchangerate()
+        if sonuc:
+            self._cache_set(cache_key, sonuc, TTL_DOVIZ)
+            return sonuc
+
+        # --- Yedek Motor: TCMB XML ---
+        logger.info("ExchangeRate-API başarısız, TCMB yedek motoru deneniyor…")
+        sonuc = self._doviz_tcmb()
+        if sonuc:
+            self._cache_set(cache_key, sonuc, TTL_DOVIZ)
+            return sonuc
+
+        return "❌ Döviz kuru verisi alınamadı. İnternet bağlantınızı kontrol edin."
+
+    def _doviz_exchangerate(self) -> Optional[str]:
+        """ExchangeRate-API üzerinden TRY bazlı kur çeker."""
+        data = self._get_json(self._EXCHANGE_URL)
+        if not data or "rates" not in data:
+            return None
+
+        rates = data["rates"]
+        try:
+            usd = 1 / rates["USD"]   # 1 USD = ? TRY
+            eur = 1 / rates["EUR"]   # 1 EUR = ? TRY
+            gbp = 1 / rates["GBP"]   # 1 GBP = ? TRY
+        except (KeyError, ZeroDivisionError):
+            return None
+
+        tarih = data.get("date", "Bilinmiyor")
         return (
-            f"💻 Melek AI System Profile:\n"
-            f"   • CPU : {self.cpu_name} ({self.cpu_cores_physical} Cores / {self.cpu_cores_logical} Threads)\n"
-            f"   • RAM : {self.ram_total_gb} GB\n"
-            f"   • GPU : {self.gpu_name} ({self.gpu_vram_total_mb} MB VRAM)\n"
-            f"   • Disk: {disk_str}"
+            f"💱 Güncel Döviz Kurları ({tarih}):\n"
+            f"   1 USD = {usd:.4f} TRY\n"
+            f"   1 EUR = {eur:.4f} TRY\n"
+            f"   1 GBP = {gbp:.4f} TRY\n"
+            f"   (Kaynak: ExchangeRate-API)"
         )
 
+    def _doviz_tcmb(self) -> Optional[str]:
+        """TCMB günlük XML servisi üzerinden kur çeker (yedek motor)."""
+        xml_text = self._get_text(self._TCMB_URL)
+        if not xml_text:
+            return None
+        try:
+            soup = BeautifulSoup(xml_text, "xml")
+            kurlar: Dict[str, str] = {}
+            for currency in soup.find_all("Currency"):
+                kod = currency.get("CurrencyCode", "")
+                alis = currency.find("ForexBuying")
+                satis = currency.find("ForexSelling")
+                if kod in ("USD", "EUR", "GBP") and alis and satis:
+                    kurlar[kod] = {
+                        "alış":  alis.text.replace(",", "."),
+                        "satış": satis.text.replace(",", "."),
+                    }
+            if not kurlar:
+                return None
 
-class MonitorMetrics:
-    """Dataclass to hold instant system utilization metrics."""
-    def __init__(self) -> None:
-        self.cpu_usage: float = 0.0
-        self.cpu_temp: float = 0.0
-        self.ram_usage_gb: float = 0.0
-        self.ram_usage_percent: float = 0.0
-        self.gpu_usage: float = 0.0
-        self.gpu_temp: float = 0.0
-        self.gpu_vram_used_mb: float = 0.0
-        self.gpu_vram_percent: float = 0.0
-        self.current_mode: str = "Idle Mode"
-        self.unresponsive_processes: List[Dict[str, Any]] = []
+            satirlar = ["💱 TCMB Günlük Döviz Kurları:"]
+            for kod, degerler in kurlar.items():
+                satirlar.append(
+                    f"   1 {kod} — Alış: {degerler['alış']} TRY | "
+                    f"Satış: {degerler['satış']} TRY"
+                )
+            return "\n".join(satirlar)
+        except Exception as exc:
+            logger.error("TCMB XML ayrıştırma hatası: %s", exc)
+            return None
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Serializes current metrics into a dictionary."""
-        return {
-            "cpu_usage": self.cpu_usage,
-            "cpu_temp": self.cpu_temp,
-            "ram_usage_gb": self.ram_usage_gb,
-            "ram_usage_percent": self.ram_usage_percent,
-            "gpu_usage": self.gpu_usage,
-            "gpu_temp": self.gpu_temp,
-            "gpu_vram_used_mb": self.gpu_vram_used_mb,
-            "gpu_vram_percent": self.gpu_vram_percent,
-            "current_mode": self.current_mode,
-            "unresponsive_processes": self.unresponsive_processes,
+    # ------------------------------------------------------------------
+    # Motor C: Wikipedia Hızlı Bilgi (Resmi Wikipedia API — No-Key)
+    # ------------------------------------------------------------------
+
+    _WIKI_API_URL = "https://tr.wikipedia.org/api/rest_v1/page/summary/{title}"
+    _WIKI_SEARCH_URL = "https://tr.wikipedia.org/w/api.php"
+
+    def wikipedia_ozet(self, konu: str) -> str:
+        """
+        Belirtilen konu hakkında Wikipedia'dan Türkçe özet çeker.
+
+        Parametreler
+        ------------
+        konu : str
+            Aranacak konu, kişi veya kavram (Türkçe).
+
+        Döndürür
+        --------
+        str
+            İlk 2-3 cümlelik Türkçe Wikipedia özeti veya hata açıklaması.
+        """
+        temiz_konu = konu.strip()
+        cache_key = f"wiki:{temiz_konu.lower()}"
+        hit, cached = self._cache_get(cache_key)
+        if hit:
+            return cached
+
+        # Önce doğrudan başlık ile dene
+        sonuc = self._wiki_dogrudan(temiz_konu)
+
+        # Bulamazsa Wikipedia arama API'si ile tahmin et
+        if not sonuc:
+            logger.info("Doğrudan başlık bulunamadı, arama API'si deneniyor: %s", temiz_konu)
+            sonuc = self._wiki_ara_ve_getir(temiz_konu)
+
+        if sonuc:
+            self._cache_set(cache_key, sonuc, TTL_WIKI)
+            return sonuc
+
+        return f"❌ '{konu}' hakkında Wikipedia'da bilgi bulunamadı."
+
+    def _wiki_dogrudan(self, baslik: str) -> Optional[str]:
+        """
+        Wikipedia REST API'sinin /page/summary/{title} uç noktasını kullanır.
+        Başarısız olursa None döner.
+        """
+        url = self._WIKI_API_URL.format(title=requests.utils.quote(baslik))
+        data = self._get_json(url)
+        if not data:
+            return None
+        return self._wiki_veri_isle(data, baslik)
+
+    def _wiki_ara_ve_getir(self, arama_terimi: str) -> Optional[str]:
+        """
+        Wikipedia arama API'si ile en alakalı başlığı bulur, ardından özetini çeker.
+        """
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": arama_terimi,
+            "srlimit": 1,
+            "format": "json",
+            "uselang": "tr",
         }
+        data = self._get_json(self._WIKI_SEARCH_URL, params=params)
+        if not data:
+            return None
 
-    def __str__(self) -> str:
-        unresponsive_str = ", ".join([f"{p['name']}(PID:{p['pid']})" for p in self.unresponsive_processes]) or "None"
+        arama_sonuclari = data.get("query", {}).get("search", [])
+        if not arama_sonuclari:
+            return None
+
+        bulunan_baslik = arama_sonuclari[0]["title"]
+        logger.info("Wikipedia araması sonucu: '%s' → '%s'", arama_terimi, bulunan_baslik)
+        return self._wiki_dogrudan(bulunan_baslik)
+
+    @staticmethod
+    def _wiki_veri_isle(data: Dict, orijinal_konu: str) -> Optional[str]:
+        """
+        Wikipedia API'sinden gelen JSON verisini Türkçe özet metne dönüştürür.
+        """
+        # Belirsizlik sayfaları ve bulunamayan sayfalar için erken çıkış
+        tip = data.get("type", "")
+        if tip in ("disambiguation", "https://mediawiki.org/wiki/HyperSwitch/errors/not_found"):
+            logger.warning("Wikipedia belirsizlik/bulunamadı: %s", orijinal_konu)
+            return None
+
+        ozet = data.get("extract", "").strip()
+        if not ozet:
+            return None
+
+        baslik = data.get("title", orijinal_konu)
+
+        # İlk 3 cümleyi al (nokta+boşluk ile böl, boş olanları filtrele)
+        cumleler = [c.strip() for c in ozet.split(". ") if c.strip()]
+        ilk_uc = ". ".join(cumleler[:3])
+        if ilk_uc and not ilk_uc.endswith("."):
+            ilk_uc += "."
+
+        wiki_url = data.get("content_urls", {}).get("desktop", {}).get("page", "")
+        url_satir = f"\n   🔗 {wiki_url}" if wiki_url else ""
+
         return (
-            f"📊 Metrics Monitor [{self.current_mode}]:\n"
-            f"   • CPU Usage: {self.cpu_usage}% | Temp: {self.cpu_temp}°C\n"
-            f"   • RAM Usage: {self.ram_usage_gb} GB ({self.ram_usage_percent}%)\n"
-            f"   • GPU Usage: {self.gpu_usage}% | Temp: {self.gpu_temp}°C | VRAM: {self.gpu_vram_used_mb} MB ({self.gpu_vram_percent:.1f}%)\n"
-            f"   • Hung Apps: {unresponsive_str}"
+            f"📖 {baslik} hakkında Wikipedia özeti:\n"
+            f"   {ilk_uc}"
+            f"{url_satir}"
         )
 
+    # ------------------------------------------------------------------
+    # Önbellek yönetim araçları
+    # ------------------------------------------------------------------
 
-class SystemDetector:
-    """Helper module to query hardware specifications on Windows."""
-    
-    @staticmethod
-    def detect_all() -> SystemInfo:
-        """Runs all hardware detection methods and returns a SystemInfo profile."""
-        info = SystemInfo()
-        
-        # 1. CPU name & cores
-        info.cpu_name = SystemDetector._get_cpu_name()
-        info.cpu_cores_physical = psutil.cpu_count(logical=False) or 6
-        info.cpu_cores_logical = psutil.cpu_count(logical=True) or 12
+    def cache_temizle(self) -> None:
+        """Tüm önbelleği sıfırlar."""
+        self._cache.clear()
+        logger.info("Önbellek tamamen temizlendi.")
 
-        # 2. RAM capacity
-        mem = psutil.virtual_memory()
-        info.ram_total_gb = round(mem.total / (1024 ** 3), 2)
-
-        # 3. GPU details via nvidia-smi
-        info.gpu_name, info.gpu_vram_total_mb = SystemDetector._get_gpu_specs()
-
-        # 4. Storage drives
-        info.disks = SystemDetector._get_disk_specs()
-
-        return info
-
-    @staticmethod
-    def _get_cpu_name() -> str:
-        """Retrieves CPU processor model name via WMI or platform fallback."""
-        try:
-            import wmi
-            c = wmi.WMI()
-            processors = c.Win32_Processor()
-            if processors:
-                return processors[0].Name.strip()
-        except Exception as e:
-            logger.debug("WMI CPU query failed: %s. Using fallback.", e)
-        
-        # Fallback using platform/registry info
-        cpu = platform.processor()
-        if not cpu:
-            try:
-                # Read from Registry
-                import winreg
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
-                cpu = winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
-            except Exception:
-                cpu = "AMD Ryzen 5 4600H with Radeon Graphics (Estimated)"
-        return cpu
-
-    @staticmethod
-    def _get_gpu_specs() -> Tuple[str, float]:
-        """Queries nvidia-smi for GPU name and VRAM capacity."""
-        try:
-            cmd = ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            output = subprocess.check_output(cmd, startupinfo=startupinfo, text=True, stderr=subprocess.DEVNULL)
-            parts = [p.strip() for p in output.split(",")]
-            if len(parts) >= 2:
-                return parts[0], float(parts[1])
-        except Exception as e:
-            logger.debug("nvidia-smi GPU query failed: %s", e)
-        # Standard default configuration matching system spec
-        return "NVIDIA GeForce RTX 3050 Laptop GPU (Auto-Fallback)", 4096.0
-
-    @staticmethod
-    def _get_disk_specs() -> List[Dict[str, Any]]:
-        """Queries physical drive details using WMI or partitions fallback."""
-        disks = []
-        try:
-            import wmi
-            c = wmi.WMI()
-            drives = c.Win32_DiskDrive()
-            for d in drives:
-                size_gb = round(int(d.Size) / (1024 ** 3), 2) if d.Size else 0.0
-                disks.append({
-                    "model": d.Model or d.Caption or "Unknown SSD",
-                    "size_gb": size_gb
-                })
-            if disks:
-                return disks
-        except Exception as e:
-            logger.debug("WMI Disk query failed: %s", e)
-
-        # Fallback to partitions
-        try:
-            for part in psutil.disk_partitions():
-                if 'cdrom' in part.opts or not part.device:
-                    continue
-                try:
-                    usage = psutil.disk_usage(part.mountpoint)
-                    disks.append({
-                        "model": f"Disk Drive ({part.mountpoint})",
-                        "size_gb": round(usage.total / (1024 ** 3), 2)
-                    })
-                except Exception:
-                    pass
-        except Exception:
-            pass
-            
-        if not disks:
-            disks.append({"model": "M.2 SSD", "size_gb": 512.0})
-        return disks
-
-
-class MonitorConfig:
-    """Configuration class containing alert thresholds and mode definitions."""
-    def __init__(self) -> None:
-        # Idle Mode Limits
-        self.idle_cpu_temp_limit: float = 70.0
-        self.idle_gpu_temp_limit: float = 65.0
-
-        # Game Mode Limits (Tolerate higher temps under load)
-        self.game_cpu_temp_limit: float = 85.0
-        self.game_gpu_temp_limit: float = 80.0
-
-        # General warnings (percentages)
-        self.ram_percent_limit: float = 90.0
-        self.vram_percent_limit: float = 90.0
-
-        # Automatic game mode detection criteria
-        self.gpu_usage_game_threshold: float = 25.0
-        self.cpu_usage_game_threshold: float = 40.0
-        self.game_mode_hysteresis_seconds: float = 10.0  # Time to wait before switching from game back to idle
-
-        # Common game executable names for process name matching
-        self.game_processes = {
-            "cs2.exe", "csgo.exe", "valorant.exe", "gta5.exe",
-            "cyberpunk2077.exe", "rdr2.exe", "witcher3.exe",
-            "leagueoflegends.exe", "dota2.exe", "minecraft.exe",
-            "cod.exe", "apex.exe", "pubg.exe", "fifa.exe"
-        }
-
-
-class HardwareMonitor:
-    """Main non-blocking engine to monitor hardware parameters and process health."""
-    def __init__(self, config: Optional[MonitorConfig] = None, interval: float = 2.0) -> None:
-        self.config: MonitorConfig = config or MonitorConfig()
-        self.interval: float = interval
-        self.metrics: MonitorMetrics = MonitorMetrics()
-        
-        # Background loop controls
-        self.is_running: bool = False
-        self._thread: Optional[threading.Thread] = None
-        self._lock: threading.Lock = threading.Lock()
-        
-        # Callback bindings
-        self.on_temp_warning: Optional[Callable[[str, float, float], None]] = None
-        self.on_vram_warning: Optional[Callable[[float, float, float], None]] = None
-        self.on_unresponsive_app: Optional[Callable[[str, int], bool]] = None
-        
-        # Cooldown management (prevents spamming callbacks)
-        self._last_cpu_temp_alert_time: float = 0.0
-        self._last_gpu_temp_alert_time: float = 0.0
-        self._last_vram_alert_time: float = 0.0
-        self._alert_cooldown_seconds: float = 30.0
-        
-        # Set of process IDs that have already been flagged as unresponsive
-        self._flagged_unresponsive_pids: set[int] = set()
-        
-        # Game Mode status history
-        self._last_game_activity_time: float = 0.0
-        self._current_mode: str = "Idle Mode"
-
-        # Simulation / Mock Mode controls
-        self.simulation_mode: bool = False
-        self._sim_metrics: Optional[MonitorMetrics] = None
-
-    def start(self) -> None:
-        """Starts the background hardware monitoring thread."""
-        with self._lock:
-            if self.is_running:
-                logger.warning("Monitor is already running.")
-                return
-            
-            self.is_running = True
-            self._thread = threading.Thread(target=self._monitor_loop, daemon=True, name="MelekMonitorThread")
-            self._thread.start()
-            logger.info("Background Hardware Monitoring Thread started.")
-
-    def stop(self) -> None:
-        """Stops the background hardware monitoring thread."""
-        with self._lock:
-            if not self.is_running:
-                return
-            self.is_running = False
-            logger.info("Stopping Background Hardware Monitoring Thread...")
-        
-        if self._thread:
-            self._thread.join(timeout=3.0)
-            logger.info("Background Hardware Monitoring Thread stopped.")
-
-    def inject_simulation_metrics(self, sim_metrics: MonitorMetrics) -> None:
-        """Sets metrics to override hardware reads when in simulation mode."""
-        self._sim_metrics = sim_metrics
-
-    def _monitor_loop(self) -> None:
-        """Core monitoring loop run on the background daemon thread."""
-        # Initialize CPU utilization check (discard first reading as it returns 0.0)
-        psutil.cpu_percent(interval=None)
-        
-        while self.is_running:
-            try:
-                cycle_start = time.time()
-                
-                # Fetch metrics based on mode
-                if self.simulation_mode and self._sim_metrics:
-                    current_metrics = self._sim_metrics
-                else:
-                    current_metrics = self._gather_physical_metrics()
-                
-                # Update shared thread-safe metrics object
-                with self._lock:
-                    self.metrics = current_metrics
-                    self._current_mode = current_metrics.current_mode
-                
-                # Run rule checks and alert triggers
-                self._check_alert_rules(current_metrics)
-                
-                # Sleep adjusted for execution time to maintain precise interval
-                elapsed = time.time() - cycle_start
-                sleep_time = max(0.1, self.interval - elapsed)
-                time.sleep(sleep_time)
-                
-            except Exception as e:
-                logger.error("Unhandled error in background monitor loop: %s", e, exc_info=True)
-                time.sleep(self.interval)
-
-    def _gather_physical_metrics(self) -> MonitorMetrics:
-        """Polls actual Windows hardware controllers and processes."""
-        metrics = MonitorMetrics()
-
-        # 1. CPU utilization
-        metrics.cpu_usage = psutil.cpu_percent(interval=None)
-
-        # 2. RAM metrics
-        mem = psutil.virtual_memory()
-        metrics.ram_usage_gb = round(mem.used / (1024 ** 3), 2)
-        metrics.ram_usage_percent = mem.percent
-
-        # 3. GPU metrics via nvidia-smi
-        gpu_util, gpu_temp, vram_used_mb = self._get_gpu_metrics()
-        metrics.gpu_usage = gpu_util
-        metrics.gpu_temp = gpu_temp
-        metrics.gpu_vram_used_mb = vram_used_mb
-        
-        # GPU total VRAM lookup
-        total_vram = 4096.0
-        try:
-            # Detect total VRAM from drivers or default
-            total_vram = SystemDetector.detect_all().gpu_vram_total_mb
-        except Exception:
-            pass
-        metrics.gpu_vram_percent = (vram_used_mb / total_vram) * 100.0 if total_vram > 0 else 0.0
-
-        # 4. CPU temperature estimation or fallback WMI
-        metrics.cpu_temp = self._get_cpu_temp(metrics.cpu_usage, metrics.gpu_temp)
-
-        # 5. Get list of hung processes
-        metrics.unresponsive_processes = self._get_unresponsive_processes()
-
-        # 6. Mode Decision Logic (Game Mode vs Idle Mode)
-        is_game_active = False
-        
-        # Check active foreground window process
-        fg_pid = self._get_foreground_process_pid()
-        if fg_pid > 0:
-            try:
-                fg_proc = psutil.Process(fg_pid)
-                proc_name = fg_proc.name().lower()
-                if proc_name in self.config.game_processes:
-                    is_game_active = True
-            except Exception:
-                pass
-
-        # Also trigger game mode if GPU usage is high
-        if metrics.gpu_usage >= self.config.gpu_usage_game_threshold:
-            is_game_active = True
-            
-        now = time.time()
-        if is_game_active:
-            self._last_game_activity_time = now
-            metrics.current_mode = "Game Mode"
-        else:
-            # Hysteresis to prevent frequent flipping back and forth
-            if now - self._last_game_activity_time < self.config.game_mode_hysteresis_seconds:
-                metrics.current_mode = "Game Mode"
-            else:
-                metrics.current_mode = "Idle Mode"
-
-        return metrics
-
-    def _get_cpu_temp(self, cpu_usage: float, gpu_temp: float) -> float:
-        """Retrieves CPU Temperature. Fallback: calculates load-based estimate if admin WMI blocked."""
-        # Try Admin WMI
-        try:
-            import pythoncom
-            import wmi
-            pythoncom.CoInitialize()
-            try:
-                w = wmi.WMI(namespace="root/wmi")
-                zones = w.MSAcpi_ThermalZoneTemperature()
-                if zones:
-                    raw_temp = zones[0].CurrentTemperature
-                    celsius = (raw_temp / 10.0) - 273.15
-                    if 0 < celsius < 120:
-                        return round(celsius, 1)
-            finally:
-                pythoncom.CoUninitialize()
-        except Exception:
-            pass
-            
-        # Standard load-based estimate (optimized for AMD Ryzen 5 4600H)
-        idle_temp = 45.0
-        max_load_addition = 35.0  # Max load raises temp to 80°C
-        cpu_load_ratio = cpu_usage / 100.0
-        
-        # GPU heat adds thermal pressure inside laptops
-        thermal_pressure = 0.0
-        if gpu_temp > 50.0:
-            thermal_pressure = (gpu_temp - 50.0) * 0.35  # max ~10°C transfer
-            
-        estimated = idle_temp + (max_load_addition * cpu_load_ratio) + thermal_pressure
-        return round(estimated, 1)
-
-    def _get_gpu_metrics(self) -> Tuple[float, float, float]:
-        """Queries nvidia-smi. Returns: (gpu_usage_percent, gpu_temp, vram_used_mb)"""
-        try:
-            cmd = ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,memory.used", "--format=csv,noheader,nounits"]
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            output = subprocess.check_output(cmd, startupinfo=startupinfo, text=True, stderr=subprocess.DEVNULL)
-            parts = [p.strip() for p in output.split(",")]
-            if len(parts) >= 3:
-                return float(parts[0]), float(parts[1]), float(parts[2])
-        except Exception:
-            pass
-        return 0.0, 42.0, 0.0
-
-    def _get_foreground_process_pid(self) -> int:
-        """Calls Windows user32 to get active foreground process ID."""
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetForegroundWindow()
-            if hwnd:
-                pid = ctypes.c_ulong()
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                return pid.value
-        except Exception:
-            pass
-        return 0
-
-    def _get_unresponsive_processes(self) -> List[Dict[str, Any]]:
-        """Parses output of tasklist looking for processes in 'NOT RESPONDING' state."""
-        unresponsive = []
-        try:
-            cmd = ["tasklist", "/FI", "STATUS eq NOT RESPONDING", "/FO", "CSV"]
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            output = subprocess.check_output(cmd, startupinfo=startupinfo, text=True, stderr=subprocess.DEVNULL)
-            
-            lines = output.strip().splitlines()
-            if not lines:
-                return unresponsive
-                
-            reader = csv.reader(lines)
-            for row in reader:
-                if not row or len(row) < 2:
-                    continue
-                # Skip column header row
-                if "Image Name" in row[0]:
-                    continue
-                # Skip status information messages
-                if "INFO:" in row[0]:
-                    continue
-                
-                try:
-                    name = row[0]
-                    pid = int(row[1])
-                    unresponsive.append({
-                        "name": name,
-                        "pid": pid
-                    })
-                except ValueError:
-                    pass
-        except Exception:
-            pass
-        return unresponsive
-
-    def kill_process(self, pid: int) -> bool:
-        """Forces the termination of a process using psutil and taskkill."""
-        logger.info("Attempting to terminate process with PID %d...", pid)
-        try:
-            p = psutil.Process(pid)
-            p.terminate()
-            p.wait(timeout=2.0)
-            logger.info("Process %d terminated gracefully.", pid)
-            return True
-        except Exception as e:
-            logger.debug("psutil terminate failed: %s. Using force kill.", e)
-            try:
-                cmd = ["taskkill", "/F", "/PID", str(pid)]
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                subprocess.check_call(cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                logger.info("Process %d force-killed via taskkill.", pid)
-                return True
-            except Exception as ex:
-                logger.error("Failed to terminate process %d: %s", pid, ex)
-                return False
-
-    def _check_alert_rules(self, m: MonitorMetrics) -> None:
-        """Checks limits, handles alert cooldowns, and triggers callbacks in non-blocking threads."""
-        now = time.time()
-        
-        # Set threshold limits based on active mode
-        if m.current_mode == "Game Mode":
-            cpu_limit = self.config.game_cpu_temp_limit
-            gpu_limit = self.config.game_gpu_temp_limit
-        else:
-            cpu_limit = self.config.idle_cpu_temp_limit
-            gpu_limit = self.config.idle_gpu_temp_limit
-
-        # 1. CPU Temp warning
-        if m.cpu_temp >= cpu_limit:
-            if now - self._last_cpu_temp_alert_time >= self._alert_cooldown_seconds:
-                self._last_cpu_temp_alert_time = now
-                if self.on_temp_warning:
-                    # Spawn in thread to avoid blocking background loop
-                    threading.Thread(
-                        target=self.on_temp_warning,
-                        args=("CPU", m.cpu_temp, cpu_limit),
-                        daemon=True
-                    ).start()
-
-        # 2. GPU Temp warning
-        if m.gpu_temp >= gpu_limit:
-            if now - self._last_gpu_temp_alert_time >= self._alert_cooldown_seconds:
-                self._last_gpu_temp_alert_time = now
-                if self.on_temp_warning:
-                    threading.Thread(
-                        target=self.on_temp_warning,
-                        args=("GPU", m.gpu_temp, gpu_limit),
-                        daemon=True
-                    ).start()
-
-        # 3. VRAM warning
-        if m.gpu_vram_percent >= self.config.vram_percent_limit:
-            if now - self._last_vram_alert_time >= self._alert_cooldown_seconds:
-                self._last_vram_alert_time = now
-                if self.on_vram_warning:
-                    # Resolve total VRAM capacity
-                    total_vram = 4096.0
-                    try:
-                        total_vram = SystemDetector.detect_all().gpu_vram_total_mb
-                    except Exception:
-                        pass
-                    threading.Thread(
-                        target=self.on_vram_warning,
-                        args=(m.gpu_vram_used_mb, total_vram, m.gpu_vram_percent),
-                        daemon=True
-                    ).start()
-
-        # 4. Unresponsive Process Alerts & Callback Bridge
-        current_unresponsive_pids = set()
-        for proc in m.unresponsive_processes:
-            pid = proc["pid"]
-            name = proc["name"]
-            current_unresponsive_pids.add(pid)
-            
-            # Warn only once per unresponsive process instance
-            if pid not in self._flagged_unresponsive_pids:
-                self._flagged_unresponsive_pids.add(pid)
-                if self.on_unresponsive_app:
-                    # Dispatch to handler function
-                    threading.Thread(
-                        target=self._handle_unresponsive_callback,
-                        args=(name, pid),
-                        daemon=True
-                    ).start()
-
-        # Clean up stale process IDs that are no longer present
-        self._flagged_unresponsive_pids &= current_unresponsive_pids
-
-    def _handle_unresponsive_callback(self, name: str, pid: int) -> None:
-        """Bridge executor which calls user callback and handles auto-termination choice."""
-        try:
-            if self.on_unresponsive_app:
-                approved = self.on_unresponsive_app(name, pid)
-                if approved:
-                    self.kill_process(pid)
-                else:
-                    logger.info("Process cleanup for %s (PID:%d) was rejected by client callback.", name, pid)
-        except Exception as e:
-            logger.error("Error executing unresponsive app callback: %s", e)
+    def cache_raporu(self) -> str:
+        """
+        Mevcut önbellek durumunu insan okunur biçimde döner.
+        """
+        if not self._cache:
+            return "Önbellek boş."
+        satirlar = ["📦 Önbellek Durumu:"]
+        for key, entry in self._cache.items():
+            durum = f"{entry.remaining():.0f}s kaldı" if entry.is_valid() else "SÜRESI DOLDU"
+            satirlar.append(f"   [{durum}] {key}")
+        return "\n".join(satirlar)
 
 
 # ===========================================================================
-# LOCAL SIMULATION TEST HARNESS
+# Test / Demo Bloğu
 # ===========================================================================
 
 if __name__ == "__main__":
+
     print("=" * 65)
-    print("   MELEK SYS MONITORING SYSTEM — VERIFICATION & SIMULATION TEST")
+    print("  MELEK FETCH CONTROLLER — Test Simülasyonu")
     print("=" * 65)
 
-    # 1. Test Physical System Hardware Recognition
-    print("\n[STEP 1] Checking Local Hardware Specifications...")
-    print("-" * 55)
-    profile = SystemDetector.detect_all()
-    print(profile)
+    melek = MelekFetchController()
 
-    # 2. Initialize Monitor
-    print("\n[STEP 2] Launching Hardware Monitor Core...")
-    print("-" * 55)
-    monitor = HardwareMonitor(interval=1.0)
+    # -----------------------------------------------------------------------
+    # SENARYO 1: Döviz Kurları
+    # -----------------------------------------------------------------------
+    print("\n[SENARYO 1] Canlı Döviz Kurları")
+    print("-" * 45)
+    print(melek.doviz_kurlari())
 
-    # Define warning and bridge callbacks
-    def temp_callback(component: str, temp: float, limit: float) -> None:
-        print(f"\n⚠️  [ALERT CALLBACK] {component} overheating! Temp: {temp}°C (Limit: {limit}°C)")
+    # -----------------------------------------------------------------------
+    # SENARYO 2: Hava Durumu
+    # -----------------------------------------------------------------------
+    print("\n[SENARYO 2] Anlık Hava Durumu — İstanbul")
+    print("-" * 45)
+    print(melek.hava_durumu("Istanbul"))
 
-    def vram_callback(used: float, total: float, percent: float) -> None:
-        print(f"\n⚠️  [ALERT CALLBACK] VRAM Bottleneck! Used: {used:.1f}MB / {total:.1f}MB ({percent:.1f}%)")
+    # -----------------------------------------------------------------------
+    # SENARYO 3: Wikipedia Özeti
+    # -----------------------------------------------------------------------
+    print("\n[SENARYO 3] Wikipedia Özeti — Yapay Zeka")
+    print("-" * 45)
+    print(melek.wikipedia_ozet("Yapay zeka"))
 
-    def unresponsive_callback(app_name: str, pid: int) -> bool:
-        print(f"\n🛑 [CONFIRMATION BRIDGE] Unresponsive application detected: '{app_name}' (PID: {pid})")
-        # Ask simulated user approval (automatically approve in script verification)
-        print(f"   --> Simulated User: APPROVED termination of '{app_name}'.")
-        return True
+    # -----------------------------------------------------------------------
+    # SENARYO 4: Önbellek Doğrulama Testi
+    # -----------------------------------------------------------------------
+    print("\n[SENARYO 4] Önbellek Doğrulama — Albert Einstein")
+    print("-" * 45)
+    print("► 1. İstek (internetten çekilecek):")
+    print(melek.wikipedia_ozet("Albert Einstein"))
 
-    # Register callbacks
-    monitor.on_temp_warning = temp_callback
-    monitor.on_vram_warning = vram_callback
-    monitor.on_unresponsive_app = unresponsive_callback
+    print("\n  [ 2 saniye bekleniyor… ]")
+    time.sleep(2)
 
-    # Start the engine
-    monitor.start()
+    print("\n► 2. İstek (önbellekten okunmalı):")
+    print(melek.wikipedia_ozet("Albert Einstein"))
 
-    # Read active physical state to verify thread is polling data
-    time.sleep(1.5)
-    with monitor._lock:
-        real_metrics = monitor.metrics
-    print("\n[REAL-TIME POLLING CHECK] First metrics capture from hardware:")
-    print(real_metrics)
-
-    # 3. Enter Simulation Mode to prove alerts and callbacks fire accurately
-    print("\n[STEP 3] Entering Simulation Mode (Simulating Spikes & Hung Apps)...")
-    print("-" * 55)
-    monitor.simulation_mode = True
-
-    # Scenario A: Idle Mode Overheat
-    print("\n► Scenario A: Simulating Idle mode overheating...")
-    sim_a = MonitorMetrics()
-    sim_a.cpu_usage = 12.0
-    sim_a.cpu_temp = 78.5  # Exceeds idle limit (70.0)
-    sim_a.ram_usage_gb = 5.2
-    sim_a.ram_usage_percent = 32.5
-    sim_a.gpu_usage = 5.0
-    sim_a.gpu_temp = 42.0
-    sim_a.gpu_vram_used_mb = 800.0
-    sim_a.gpu_vram_percent = 19.5
-    sim_a.current_mode = "Idle Mode"
-    
-    monitor.inject_simulation_metrics(sim_a)
-    time.sleep(1.2)  # Allow monitor loop to run check
-
-    # Scenario B: Game Mode Activation & VRAM Bottleneck + Unresponsive App
-    print("\n► Scenario B: Simulating Gaming, High VRAM usage (95%), and a Hung Game process...")
-    sim_b = MonitorMetrics()
-    sim_b.cpu_usage = 65.0
-    sim_b.cpu_temp = 82.0  # Exceeds Idle limit but SAFE in Game Mode (Limit: 85)
-    sim_b.ram_usage_gb = 12.8
-    sim_b.ram_usage_percent = 80.0
-    sim_b.gpu_usage = 89.0
-    sim_b.gpu_temp = 76.0
-    sim_b.gpu_vram_used_mb = 3980.0  # 97.1% VRAM - triggers bottleneck warning
-    sim_b.gpu_vram_percent = 97.1
-    sim_b.current_mode = "Game Mode"
-    sim_b.unresponsive_processes = [{"name": "Cyberpunk2077.exe", "pid": 9999}]
-    
-    # We must register mock process list to satisfy kill checks
-    # To prevent actual process killing of a random PID, our test callback handles simulation approval
-    monitor.inject_simulation_metrics(sim_b)
-    time.sleep(1.2)
-
-    # Cleanup and Stop Monitor
-    print("\n[STEP 4] Stopping Monitor Thread and Finalizing...")
-    print("-" * 55)
-    monitor.stop()
-    print("Test Simulation finished successfully. All callbacks verified.")
+    # Önbellek raporu
+    print("\n" + "=" * 65)
+    print(melek.cache_raporu())
+    print("=" * 65)
+    print("  Test simülasyonu tamamlandı.")
     print("=" * 65)
